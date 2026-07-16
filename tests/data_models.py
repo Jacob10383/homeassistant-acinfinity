@@ -63,6 +63,10 @@ LOGIN_PAYLOAD = {
         "appIsanalytics": 0,
         "appIsbugreport": 0,
         "appIsemailrepost": 0,
+        "refreshToken": "unit-test-refresh-token",
+        "secretId": "0123456789abcdef0123456789abcdef",
+        "requestApp": "Android_unit_test",
+        "timeOut": 2000000000,
         "createTime": None,
     },
 }

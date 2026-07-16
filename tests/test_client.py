@@ -1,11 +1,13 @@
 import asyncio
+import copy
+import hashlib
 import re
 import sys
 from unittest.mock import MagicMock
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import pytest
-from aioresponses import aioresponses
+from aioresponses import CallbackResult, aioresponses
 
 from custom_components.ac_infinity.client import (
     API_URL_ADD_DEV_MODE,
@@ -14,13 +16,22 @@ from custom_components.ac_infinity.client import (
     API_URL_GET_DEVICE_INFO_LIST_ALL,
     API_URL_LOGIN,
     API_URL_MODE_AND_SETTINGS,
+    API_URL_REFRESH_TOKEN,
     API_URL_UPDATE_ADV_SETTING,
+    API_URL_UPDATE_MASTER_PORT,
+    ANDROID_APP_VERSION,
     ACInfinityClient,
     ACInfinityClientCannotConnect,
     ACInfinityClientInvalidAuth,
     ACInfinityClientRequestFailed,
 )
-from custom_components.ac_infinity.const import AdvancedSettingsKey, AtType, DeviceControlKey, ModeAndSettingKeys
+from custom_components.ac_infinity.const import (
+    AdvancedSettingsKey,
+    AtType,
+    ControllerType,
+    DeviceControlKey,
+    ModeAndSettingKeys,
+)
 from tests.data_models import (
     DEVICE_ID,
     DEVICE_INFO_LIST_ALL_PAYLOAD,
@@ -88,6 +99,10 @@ class TestACInfinityClient:
             await client.login()
 
             assert client._user_id is not None
+            assert client._refresh_token == LOGIN_PAYLOAD["data"]["refreshToken"]
+            assert client._secret_id == LOGIN_PAYLOAD["data"]["secretId"]
+            assert client._request_app == LOGIN_PAYLOAD["data"]["requestApp"]
+            assert client._token_expires_at == LOGIN_PAYLOAD["data"]["timeOut"]
 
     @pytest.mark.parametrize(
         "password,expected",
@@ -612,5 +627,281 @@ class TestACInfinityClient:
                     await client.update_ai_device_control_and_settings(
                         DEVICE_ID, 1, {DeviceControlKey.AT_TYPE: 999}
                     )
+        finally:
+            await client.close()
+
+    @staticmethod
+    def __make_signed_ai_client() -> ACInfinityClient:
+        client = ACInfinityClient(HOST, EMAIL, PASSWORD)
+        client._user_id = USER_ID
+        client._refresh_token = "unit-test-refresh-token"
+        client._secret_id = "0123456789abcdef0123456789abcdef"
+        client._request_app = "Android_unit_test"
+        client._token_expires_at = 2000000000
+        return client
+
+    @staticmethod
+    def __make_ai_plus_mode_payloads(
+        actual_speed: int = 3, readback_master_port: int = 1
+    ):
+        before = copy.deepcopy(GET_DEV_MODE_SETTING_LIST_PAYLOAD)
+        before_data = before["data"]
+        before_data[DeviceControlKey.DEV_ID] = str(DEVICE_ID)
+        before_data[DeviceControlKey.EXTERNAL_PORT] = 1
+        before_data[DeviceControlKey.MASTER_PORT] = 1
+        before_data[DeviceControlKey.AT_TYPE] = AtType.ON
+        before_data[DeviceControlKey.ON_SELF_SPEED] = 2
+        before_data[DeviceControlKey.SPEAK] = 2
+        before_data["deviceColor"] = 77
+        before_data[DeviceControlKey.DEV_SETTING][DeviceControlKey.EXTERNAL_PORT] = 1
+        before_data[DeviceControlKey.DEV_SETTING][DeviceControlKey.ON_SELF_SPEED] = 2
+
+        readback = copy.deepcopy(before)
+        readback_data = readback["data"]
+        readback_data[DeviceControlKey.ON_SELF_SPEED] = 3
+        readback_data[DeviceControlKey.SPEAK] = actual_speed
+        readback_data[DeviceControlKey.MASTER_PORT] = readback_master_port
+        readback_data[DeviceControlKey.DEV_SETTING][DeviceControlKey.ON_SELF_SPEED] = 3
+        return before, readback
+
+    @staticmethod
+    def __flatten_requests(mocked):
+        return [
+            (method, url, request)
+            for (method, url), requests in mocked.requests.items()
+            for request in requests
+        ]
+
+    async def test_ai_plus_update_selects_physical_port_and_verifies_output(self, mocker):
+        """Controller AI+ updates select the port and confirm desired and actual state."""
+        client = self.__make_signed_ai_client()
+        before, readback = self.__make_ai_plus_mode_payloads()
+        get_url = (
+            f"{HOST}{API_URL_GET_DEV_MODE_SETTING}?devId={DEVICE_ID}&port=1"
+        )
+        selector_url = (
+            f"{HOST}{API_URL_UPDATE_MASTER_PORT}?devId={DEVICE_ID}&nums=1"
+        )
+        fixed_time_ns = 1700000000123000000
+        mocker.patch("time.time_ns", return_value=fixed_time_ns)
+        request_order = []
+
+        def response(name, payload):
+            def callback(_url, **_kwargs):
+                request_order.append(name)
+                return CallbackResult(status=200, payload=payload)
+
+            return callback
+
+        try:
+            with aioresponses() as mocked:
+                mocked.post(get_url, callback=response("read", before))
+                mocked.post(get_url, callback=response("readback", readback))
+                mocked.post(
+                    selector_url,
+                    callback=response("select", UPDATE_SUCCESS_PAYLOAD),
+                )
+                mocked.put(
+                    re.compile(f"{HOST}{API_URL_MODE_AND_SETTINGS}.*"),
+                    callback=response("write", UPDATE_SUCCESS_PAYLOAD),
+                )
+
+                await client.update_ai_device_control_and_settings(
+                    DEVICE_ID,
+                    1,
+                    {DeviceControlKey.ON_SELF_SPEED: 3},
+                    ControllerType.UIS_89_AI_PLUS,
+                )
+
+                requests = self.__flatten_requests(mocked)
+                assert len(requests) == 4
+                assert request_order == ["select", "read", "write", "readback"]
+                put_url = next(
+                    url
+                    for method, url, _ in requests
+                    if method == "PUT" and API_URL_MODE_AND_SETTINGS in str(url)
+                )
+                payload = dict(
+                    parse_qsl(put_url.raw_query_string, keep_blank_values=True)
+                )
+
+                assert payload[DeviceControlKey.DEV_ID] == str(DEVICE_ID)
+                assert payload[ModeAndSettingKeys.PORT] == "1"
+                assert payload[ModeAndSettingKeys.EXTERNAL_PORT] == "1"
+                assert payload[ModeAndSettingKeys.MASTER_PORT] == "1"
+                assert payload[DeviceControlKey.ON_SELF_SPEED] == "3"
+                assert payload[AdvancedSettingsKey.DYNAMIC_BUFFER_HUMIDITY] == "3"
+                assert payload["deviceColor"] == "77"
+                assert payload[ModeAndSettingKeys.MODE_AND_SETTING_ID_STR] == "[16,18]"
+                assert DeviceControlKey.DEV_SETTING not in payload
+                assert "updateAllPort" not in payload
+                assert "fieldSet" not in payload
+                assert "portResistance" not in payload
+
+                request_id = str(fixed_time_ns // 1_000_000)
+                first_hash = hashlib.md5(
+                    f"{USER_ID}{ANDROID_APP_VERSION}".encode(),
+                    usedforsecurity=False,
+                ).hexdigest()
+                second_hash = hashlib.md5(
+                    f"{client._secret_id}{client._request_app}{request_id}".encode(),
+                    usedforsecurity=False,
+                ).hexdigest()
+                expected_sign = hashlib.md5(
+                    f"{first_hash}{second_hash}".encode(),
+                    usedforsecurity=False,
+                ).hexdigest()
+                for _, _, request in requests:
+                    headers = request.kwargs["headers"]
+                    assert headers["token"] == USER_ID
+                    assert headers["minversion"] == "3.5"
+                    assert headers["devType"] == str(ControllerType.UIS_89_AI_PLUS)
+                    assert headers["requestApp"] == client._request_app
+                    assert headers["version"] == ANDROID_APP_VERSION
+                    assert headers["appVersion"] == ANDROID_APP_VERSION
+                    assert headers["phoneType"] == "2"
+                    assert headers["requestId"] == request_id
+                    assert headers["sign"] == expected_sign
+        finally:
+            await client.close()
+
+    @pytest.mark.parametrize(
+        "actual_speed,readback_master_port,error",
+        [
+            (0, 1, "physical output readback mismatch"),
+            (3, 0, "physical selector readback mismatch"),
+        ],
+    )
+    async def test_ai_plus_update_rejects_physical_mismatch(
+        self, mocker, actual_speed, readback_master_port, error
+    ):
+        """A virtual-profile-only success is rejected when hardware did not change."""
+        client = self.__make_signed_ai_client()
+        before, readback = self.__make_ai_plus_mode_payloads(
+            actual_speed, readback_master_port
+        )
+        get_url = (
+            f"{HOST}{API_URL_GET_DEV_MODE_SETTING}?devId={DEVICE_ID}&port=1"
+        )
+        selector_url = (
+            f"{HOST}{API_URL_UPDATE_MASTER_PORT}?devId={DEVICE_ID}&nums=1"
+        )
+        mocker.patch("asyncio.sleep")
+
+        try:
+            with aioresponses() as mocked:
+                mocked.post(get_url, status=200, payload=before)
+                for _ in range(4):
+                    mocked.post(get_url, status=200, payload=readback)
+                mocked.post(selector_url, status=200, payload=UPDATE_SUCCESS_PAYLOAD)
+                mocked.put(
+                    re.compile(f"{HOST}{API_URL_MODE_AND_SETTINGS}.*"),
+                    status=200,
+                    payload=UPDATE_SUCCESS_PAYLOAD,
+                )
+
+                with pytest.raises(
+                    ACInfinityClientRequestFailed,
+                    match=error,
+                ):
+                    await client.update_ai_device_control_and_settings(
+                        DEVICE_ID,
+                        1,
+                        {DeviceControlKey.ON_SELF_SPEED: 3},
+                        ControllerType.UIS_89_AI_PLUS,
+                    )
+        finally:
+            await client.close()
+
+    async def test_ai_plus_refreshes_before_token_expiry(self, mocker):
+        client = self.__make_signed_ai_client()
+        client._token_expires_at = 1200
+        mocker.patch("time.time", return_value=1000)
+        refresh = mocker.patch.object(
+            client, "_ACInfinityClient__refresh_access_token"
+        )
+
+        try:
+            await getattr(
+                client, "_ACInfinityClient__refresh_access_token_if_needed"
+            )()
+
+            refresh.assert_awaited_once_with()
+        finally:
+            await client.close()
+
+    async def test_ai_plus_request_refreshes_once_on_expired_auth(self):
+        """A signed 403 refreshes credentials and retries the failed request once."""
+        client = self.__make_signed_ai_client()
+        before, readback = self.__make_ai_plus_mode_payloads()
+        get_url = (
+            f"{HOST}{API_URL_GET_DEV_MODE_SETTING}?devId={DEVICE_ID}&port=1"
+        )
+        selector_url = (
+            f"{HOST}{API_URL_UPDATE_MASTER_PORT}?devId={DEVICE_ID}&nums=1"
+        )
+        refresh_url = (
+            f"{HOST}{API_URL_REFRESH_TOKEN}?refreshToken=unit-test-refresh-token"
+        )
+        refreshed_user_id = "refreshed-user-id"
+        refreshed_request_app = "Android_refreshed"
+
+        try:
+            with aioresponses() as mocked:
+                mocked.post(
+                    get_url,
+                    status=200,
+                    payload={"code": 403, "msg": "expired"},
+                )
+                mocked.post(get_url, status=200, payload=before)
+                mocked.post(get_url, status=200, payload=readback)
+                mocked.post(
+                    refresh_url,
+                    status=200,
+                    payload={
+                        "code": 200,
+                        "data": {
+                            "appId": refreshed_user_id,
+                            "requestApp": refreshed_request_app,
+                            "timeOut": 2100000000,
+                        },
+                    },
+                )
+                mocked.post(selector_url, status=200, payload=UPDATE_SUCCESS_PAYLOAD)
+                mocked.put(
+                    re.compile(f"{HOST}{API_URL_MODE_AND_SETTINGS}.*"),
+                    status=200,
+                    payload=UPDATE_SUCCESS_PAYLOAD,
+                )
+
+                await client.update_ai_device_control_and_settings(
+                    DEVICE_ID,
+                    1,
+                    {DeviceControlKey.ON_SELF_SPEED: 3},
+                    ControllerType.UIS_89_AI_PLUS,
+                )
+
+                requests = self.__flatten_requests(mocked)
+                refresh_request = next(
+                    request
+                    for method, url, request in requests
+                    if method == "POST" and API_URL_REFRESH_TOKEN in str(url)
+                )
+                assert refresh_request.kwargs["headers"]["token"] == USER_ID
+                assert refresh_request.kwargs["headers"]["minversion"] == ""
+                assert refresh_request.kwargs["headers"]["devType"] == ""
+
+                retried_get = [
+                    request
+                    for method, url, request in requests
+                    if method == "POST" and API_URL_GET_DEV_MODE_SETTING in str(url)
+                ][1]
+                assert retried_get.kwargs["headers"]["token"] == refreshed_user_id
+                assert (
+                    retried_get.kwargs["headers"]["requestApp"]
+                    == refreshed_request_app
+                )
+                assert client._secret_id == "0123456789abcdef0123456789abcdef"
+                assert client._refresh_token == "unit-test-refresh-token"
         finally:
             await client.close()

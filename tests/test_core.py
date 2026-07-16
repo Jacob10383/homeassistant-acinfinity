@@ -1145,7 +1145,10 @@ class TestACInfinity:
         await ac_infinity.update_device_control(ai_controller.devices[0], DeviceControlKey.AT_TYPE, 2)
 
         mock_client.update_ai_device_control_and_settings.assert_called_with(
-            str(AI_DEVICE_ID), 1, {DeviceControlKey.AT_TYPE: 2}
+            str(AI_DEVICE_ID),
+            1,
+            {DeviceControlKey.AT_TYPE: 2},
+            ControllerType.UIS_89_AI_PLUS,
         )
 
     async def test_update_ai_device_controls(self, mock_client):
@@ -1164,7 +1167,10 @@ class TestACInfinity:
         await ac_infinity.update_device_controls(ai_controller.devices[0], {DeviceControlKey.AT_TYPE: 2})
 
         mock_client.update_ai_device_control_and_settings.assert_called_with(
-            str(AI_DEVICE_ID), 1, {DeviceControlKey.AT_TYPE: 2}
+            str(AI_DEVICE_ID),
+            1,
+            {DeviceControlKey.AT_TYPE: 2},
+            ControllerType.UIS_89_AI_PLUS,
         )
 
     async def test_update_ai_device_settings(self, mock_client):
@@ -1185,7 +1191,10 @@ class TestACInfinity:
         )
 
         mock_client.update_ai_device_control_and_settings.assert_called_with(
-            str(AI_DEVICE_ID), 1, {AdvancedSettingsKey.DYNAMIC_TRANSITION_HUMIDITY: 2}
+            str(AI_DEVICE_ID),
+            1,
+            {AdvancedSettingsKey.DYNAMIC_TRANSITION_HUMIDITY: 2},
+            ControllerType.UIS_89_AI_PLUS,
         )
 
     async def test_update_ai_device_controls_retried_on_failure(self, mocker: MockFixture, mock_client):
