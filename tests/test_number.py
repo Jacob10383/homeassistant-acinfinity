@@ -125,12 +125,13 @@ class TestNumbers:
         latest = asyncio.create_task(entity.async_set_native_value(7))
         await asyncio.gather(first, second, latest)
 
-        setup.port_control_set_mock.assert_called_once_with(
+        setup.port_control_set_mock.assert_called_once()
+        assert setup.port_control_set_mock.call_args.args == (
             entity._device, DeviceControlKey.ON_SELF_SPEED, 7
         )
         assert entity.native_value == 7
 
-    async def test_new_ai_speed_cancels_in_flight_update(self, setup):
+    async def test_new_ai_speed_waits_for_in_flight_update(self, setup):
         setup.ac_infinity._device_controls[(str(AI_DEVICE_ID), 1)] = (
             setup.ac_infinity._device_controls[(str(DEVICE_ID), 1)].copy()
         )
@@ -142,16 +143,19 @@ class TestNumbers:
             mac_addr=AI_MAC_ADDR,
         )
         started = asyncio.Event()
+        release = asyncio.Event()
 
-        async def update(_device, _key, value):
+        async def update(_device, _key, value, **_kwargs):
             if value == 3:
                 started.set()
-                await asyncio.Future()
+                await release.wait()
 
         setup.port_control_set_mock.side_effect = update
         first = asyncio.create_task(entity.async_set_native_value(3))
         await started.wait()
         latest = asyncio.create_task(entity.async_set_native_value(7))
+        await asyncio.sleep(0)
+        release.set()
         await asyncio.gather(first, latest)
 
         assert [call.args[2] for call in setup.port_control_set_mock.call_args_list] == [3, 7]

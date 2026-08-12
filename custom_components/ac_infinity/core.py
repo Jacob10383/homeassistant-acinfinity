@@ -737,6 +737,7 @@ class ACInfinityService:
         device: ACInfinityDevice,
         setting_key: str,
         new_value: int,
+        retry_if: Callable[[], bool] | None = None,
     ):
         """Update the value of a setting via the AC Infinity API
 
@@ -745,12 +746,13 @@ class ACInfinityService:
             setting_key: the setting to update the value of
             new_value: the new value of the setting to set
         """
-        await self.update_device_controls(device, {setting_key: new_value})
+        await self.update_device_controls(device, {setting_key: new_value}, retry_if)
 
     async def update_device_controls(
         self,
         device: ACInfinityDevice,
         key_values: dict[str, int],
+        retry_if: Callable[[], bool] | None = None,
     ):
         if device.controller.is_ai_controller:
             await self.__update_ai_control_and_settings(
@@ -758,6 +760,7 @@ class ACInfinityService:
                 device.device_port,
                 key_values,
                 device.controller.controller_type,
+                retry_if,
             )
         else:
             await self.__update_device_controls(device.controller.controller_id, device.device_port, key_values)
@@ -848,6 +851,7 @@ class ACInfinityService:
         device_port: int,
         key_values: dict[str, int],
         controller_type: int,
+        retry_if: Callable[[], bool] | None = None,
     ):
         """Update the values of a set of settings via the AC Infinity API
 
@@ -870,7 +874,8 @@ class ACInfinityService:
                 aiohttp.ClientError,
                 asyncio.TimeoutError
             ) as ex:
-
+                if retry_if is not None and not retry_if():
+                    raise
                 if try_count < 4:
                     try_count += 1
                     _LOGGER.warning("Unable to update ai device controls and settings. Retry attempt %s/4", str(try_count))
@@ -1198,4 +1203,3 @@ def enabled_fn_control(entry: ConfigEntry, device_id: str, entity_config_key: st
 def enabled_fn_setting(entry: ConfigEntry, device_id: str, entity_config_key: str) -> bool:
     setting = entry.data[ConfigurationKey.ENTITIES][device_id][entity_config_key]
     return setting == EntityConfigValue.ALL or setting == EntityConfigValue.SENSORS_AND_SETTINGS
-

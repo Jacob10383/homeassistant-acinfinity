@@ -989,6 +989,7 @@ class ACInfinityDeviceNumberEntity(ACInfinityDeviceEntity, NumberEntity):
         )
         self.entity_description = description
         self._set_value_task: asyncio.Task | None = None
+        self._pending_speed: float | None = None
         self._optimistic_value: float | None = None
 
     @property
@@ -1007,31 +1008,36 @@ class ACInfinityDeviceNumberEntity(ACInfinityDeviceEntity, NumberEntity):
             await self.coordinator.async_request_refresh()
             return
 
-        if self._set_value_task is not None:
-            self._set_value_task.cancel()
-
-        task = asyncio.create_task(self._set_latest_speed(value))
-        self._set_value_task = task
-        try:
-            await task
-        except asyncio.CancelledError:
-            if task is self._set_value_task:
-                raise
-        finally:
-            if task is self._set_value_task:
-                self._set_value_task = None
-
-    async def _set_latest_speed(self, value: float) -> None:
+        self._pending_speed = value
         self._optimistic_value = value
         self.async_write_ha_state()
-        await asyncio.sleep(1)
+        if self._set_value_task is None:
+            self._set_value_task = asyncio.create_task(self._set_latest_speed())
         try:
-            await self.entity_description.set_value_fn(self, self.device_port, value)
-            await self.coordinator.async_request_refresh()
-        except Exception:
-            self._optimistic_value = None
-            self.async_write_ha_state()
-            raise
+            await self._set_value_task
+        finally:
+            if self._set_value_task is not None and self._set_value_task.done():
+                self._set_value_task = None
+
+    async def _set_latest_speed(self) -> None:
+        await asyncio.sleep(1)
+        while self._pending_speed is not None:
+            value = self._pending_speed
+            self._pending_speed = None
+            try:
+                await self.ac_infinity.update_device_control(
+                    self._device,
+                    self.data_key,
+                    int(value),
+                    retry_if=lambda: self._pending_speed is None,
+                )
+            except Exception:
+                if self._pending_speed is not None:
+                    continue
+                self._optimistic_value = None
+                self.async_write_ha_state()
+                raise
+        await self.coordinator.async_request_refresh()
 
 
 async def async_setup_entry(
