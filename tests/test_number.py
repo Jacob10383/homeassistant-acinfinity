@@ -21,7 +21,7 @@ from tests import (
     execute_and_get_device_entity,
     setup_entity_mocks,
 )
-from tests.data_models import DEVICE_ID, MAC_ADDR
+from tests.data_models import AI_DEVICE_ID, AI_MAC_ADDR, DEVICE_ID, MAC_ADDR
 
 
 @pytest.fixture
@@ -107,6 +107,55 @@ class TestNumbers:
             entity._device, setting, 4
         )
         test_objects.refresh_mock.assert_called()
+
+    async def test_ai_speed_only_sends_latest_value(self, setup):
+        setup.ac_infinity._device_controls[(str(AI_DEVICE_ID), 1)] = (
+            setup.ac_infinity._device_controls[(str(DEVICE_ID), 1)].copy()
+        )
+        entity = await execute_and_get_device_entity(
+            setup,
+            async_setup_entry,
+            1,
+            DeviceControlKey.ON_SELF_SPEED,
+            mac_addr=AI_MAC_ADDR,
+        )
+
+        first = asyncio.create_task(entity.async_set_native_value(3))
+        second = asyncio.create_task(entity.async_set_native_value(5))
+        latest = asyncio.create_task(entity.async_set_native_value(7))
+        await asyncio.gather(first, second, latest)
+
+        setup.port_control_set_mock.assert_called_once_with(
+            entity._device, DeviceControlKey.ON_SELF_SPEED, 7
+        )
+        assert entity.native_value == 7
+
+    async def test_new_ai_speed_cancels_in_flight_update(self, setup):
+        setup.ac_infinity._device_controls[(str(AI_DEVICE_ID), 1)] = (
+            setup.ac_infinity._device_controls[(str(DEVICE_ID), 1)].copy()
+        )
+        entity = await execute_and_get_device_entity(
+            setup,
+            async_setup_entry,
+            1,
+            DeviceControlKey.ON_SELF_SPEED,
+            mac_addr=AI_MAC_ADDR,
+        )
+        started = asyncio.Event()
+
+        async def update(_device, _key, value):
+            if value == 3:
+                started.set()
+                await asyncio.Future()
+
+        setup.port_control_set_mock.side_effect = update
+        first = asyncio.create_task(entity.async_set_native_value(3))
+        await started.wait()
+        latest = asyncio.create_task(entity.async_set_native_value(7))
+        await asyncio.gather(first, latest)
+
+        assert [call.args[2] for call in setup.port_control_set_mock.call_args_list] == [3, 7]
+        assert first.done()
 
     @pytest.mark.parametrize(
         "key",

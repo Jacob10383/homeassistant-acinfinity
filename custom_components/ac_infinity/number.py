@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -987,17 +988,50 @@ class ACInfinityDeviceNumberEntity(ACInfinityDeviceEntity, NumberEntity):
             coordinator, device, description.enabled_fn, description.suitable_fn, description.at_type_fn, description.key, Platform.NUMBER
         )
         self.entity_description = description
+        self._set_value_task: asyncio.Task | None = None
+        self._optimistic_value: float | None = None
 
     @property
     def native_value(self) -> float | None:
-        return self.entity_description.get_value_fn(self, self.device_port)
+        value = self.entity_description.get_value_fn(self, self.device_port)
+        if self._optimistic_value is not None and value == self._optimistic_value:
+            self._optimistic_value = None
+        return self._optimistic_value if self._optimistic_value is not None else value
 
     async def async_set_native_value(self, value: float) -> None:
         _LOGGER.info(
             'User requesting value update of entity "%s" to "%s"', self.unique_id, value
         )
-        await self.entity_description.set_value_fn(self, self.device_port, value)
-        await self.coordinator.async_request_refresh()
+        if self.data_key != DeviceControlKey.ON_SELF_SPEED:
+            await self.entity_description.set_value_fn(self, self.device_port, value)
+            await self.coordinator.async_request_refresh()
+            return
+
+        if self._set_value_task is not None:
+            self._set_value_task.cancel()
+
+        task = asyncio.create_task(self._set_latest_speed(value))
+        self._set_value_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if task is self._set_value_task:
+                raise
+        finally:
+            if task is self._set_value_task:
+                self._set_value_task = None
+
+    async def _set_latest_speed(self, value: float) -> None:
+        self._optimistic_value = value
+        self.async_write_ha_state()
+        await asyncio.sleep(1)
+        try:
+            await self.entity_description.set_value_fn(self, self.device_port, value)
+            await self.coordinator.async_request_refresh()
+        except Exception:
+            self._optimistic_value = None
+            self.async_write_ha_state()
+            raise
 
 
 async def async_setup_entry(
